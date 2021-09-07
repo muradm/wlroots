@@ -33,6 +33,8 @@
 #include <wlr/backend/x11.h>
 #endif
 
+#define WAIT_SESSION_TIMEOUT 30000 // ms
+
 void wlr_backend_init(struct wlr_backend *backend,
 		const struct wlr_backend_impl *impl) {
 	assert(backend);
@@ -104,6 +106,53 @@ struct wlr_session *wlr_backend_get_session(struct wlr_backend *backend) {
 		return backend->impl->get_session(backend);
 	}
 	return NULL;
+}
+
+struct wait_session_active_handler {
+	bool active;
+	struct wl_listener listener;
+};
+
+static void	wait_session_active(struct wl_listener *listener, void *data) {
+	struct wait_session_active_handler *handler =
+		wl_container_of(listener, handler, listener);
+	handler->active = true;
+}
+
+static struct wlr_session *session_create_and_wait(struct wl_display *disp) {
+	struct wlr_session *session = wlr_session_create(disp);
+
+	if (!session) {
+		wlr_log(WLR_ERROR, "Failed to start a session");
+		return NULL;
+	}
+
+	if (!session->active) {
+		wlr_log(WLR_INFO, "Waiting for a session to become active");
+
+		struct wait_session_active_handler handler = {0};
+		handler.listener.notify = wait_session_active;
+		wl_signal_add(&session->events.active, &handler.listener);
+
+		struct wl_event_loop *event_loop =
+			wl_display_get_event_loop(session->display);
+
+		int ret = wl_event_loop_dispatch(event_loop, (int)WAIT_SESSION_TIMEOUT);
+		if (ret < 0) {
+			wlr_log_errno(WLR_ERROR, "Failed to wait for session active: "
+						  "wl_event_loop_dispatch failed");
+			return NULL;
+		}
+
+		wl_list_remove(&handler.listener.link);
+
+		if (!handler.active) {
+			wlr_log(WLR_ERROR, "Wait session active timeout");
+			return NULL;
+		}
+	}
+
+	return session;
 }
 
 clockid_t wlr_backend_get_presentation_clock(struct wlr_backend *backend) {
@@ -269,7 +318,7 @@ static struct wlr_backend *attempt_backend_by_name(struct wl_display *display,
 	} else if (strcmp(name, "drm") == 0 || strcmp(name, "libinput") == 0) {
 		// DRM and libinput need a session
 		if (!*session) {
-			*session = wlr_session_create(display);
+			*session = session_create_and_wait(display);
 			if (!*session) {
 				wlr_log(WLR_ERROR, "failed to start a session");
 				return NULL;
@@ -368,7 +417,7 @@ struct wlr_backend *wlr_backend_autocreate(struct wl_display *display) {
 #endif
 
 	// Attempt DRM+libinput
-	multi->session = wlr_session_create(display);
+	multi->session = session_create_and_wait(display);
 	if (!multi->session) {
 		wlr_log(WLR_ERROR, "Failed to start a DRM session");
 		wlr_backend_destroy(backend);
